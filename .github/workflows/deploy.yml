@@ -1,0 +1,51 @@
+# Reusable deploy workflow (spike for S6). Runs in the CALLER's github-pages environment.
+name: deploy
+
+on:
+  workflow_call:
+    outputs:
+      page-url:
+        description: The URL GitHub Pages serves the site at
+        value: ${{ jobs.deploy.outputs.page-url }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.d.outputs.page_url }}
+    concurrency:
+      group: pages-${{ github.repository }}
+      cancel-in-progress: false
+    outputs:
+      page-url: ${{ steps.d.outputs.page_url }}
+    steps:
+      - name: Show the OIDC claims (S6; the token itself is never printed)
+        run: |
+          set -euo pipefail
+          jwt=$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=hangfolio-spike" | jq -r .value)
+          payload=$(cut -d. -f2 <<<"$jwt" | tr '_-' '/+')
+          while [ $(( ${#payload} % 4 )) -ne 0 ]; do payload="$payload="; done
+          base64 -d <<<"$payload" | jq '{sub, repository, repository_owner, environment, ref, event_name, workflow_ref, job_workflow_ref, runner_environment}'
+
+      - name: Deploy to GitHub Pages
+        id: d
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+
+      - name: Smoke check
+        env:
+          PAGE_URL: ${{ steps.d.outputs.page_url }}
+        run: |
+          for i in 1 2 3; do
+            if curl -fsSL "$PAGE_URL" | grep -q "spike-site $GITHUB_SHA"; then
+              echo "Live at $PAGE_URL (build $GITHUB_SHA)"
+              echo "### Live at $PAGE_URL" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::warning::$PAGE_URL does not show build $GITHUB_SHA yet. GitHub can cache pages for up to 10 minutes."

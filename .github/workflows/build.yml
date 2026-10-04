@@ -1,0 +1,146 @@
+# Reusable build workflow (spike for S4 and S6). Called from a site repo's deploy.yml.
+# Everything in the github context (repository, event, ref, token) belongs to the CALLER.
+name: build
+
+on:
+  workflow_call:
+    inputs:
+      site-url:
+        description: Pins the canonical URL. Leave empty to use what GitHub Pages reports.
+        type: string
+        default: ''
+      spike-force-upload:
+        description: Spike only. Upload the Pages artifact even when nothing will deploy it.
+        type: boolean
+        default: false
+    outputs:
+      deploy:
+        description: "'true' when the caller should run deploy.yml"
+        value: ${{ jobs.build.outputs.deploy }}
+      page-url:
+        description: The base URL GitHub Pages reports, or empty
+        value: ${{ jobs.build.outputs.page-url }}
+      build-type:
+        description: "workflow, legacy or none (from GET /repos/{repo}/pages)"
+        value: ${{ jobs.preflight.outputs.build-type }}
+
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: read
+    outputs:
+      intent: ${{ steps.facts.outputs.intent }}
+      build-type: ${{ steps.pages.outputs.build-type }}
+    steps:
+      - name: Facts
+        id: facts
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          REPO: ${{ github.repository }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          intent=false
+          if [[ "$EVENT" == "push" || "$EVENT" == "workflow_dispatch" ]] && [[ "$REF_NAME" == "$DEFAULT_BRANCH" ]]; then
+            intent=true
+          fi
+          echo "intent=$intent" >> "$GITHUB_OUTPUT"
+          echo "repository=$REPO event=$EVENT ref_name=$REF_NAME default_branch=$DEFAULT_BRANCH intent=$intent"
+          echo "caller workflow_ref=$WORKFLOW_REF"
+
+      - name: Read the Pages build type (S4)
+        id: pages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set +e
+          body=$(gh api "repos/$REPO/pages" 2>err.txt)
+          rc=$?
+          set -e
+          err=$(cat err.txt)
+          echo "gh api repos/$REPO/pages -> exit $rc"
+          [ -n "$err" ] && echo "stderr: $err"
+          if [ "$rc" -eq 0 ]; then
+            build_type=$(jq -r '.build_type // "null"' <<<"$body")
+            jq '{html_url, build_type, source, status, public, https_enforced}' <<<"$body"
+          elif grep -q 'HTTP 404' <<<"$err"; then
+            build_type=none
+          else
+            build_type=error
+          fi
+          echo "S4 build_type=$build_type"
+          echo "build-type=$build_type" >> "$GITHUB_OUTPUT"
+          echo "### S4: \`GET /repos/$REPO/pages\` with \`pages: read\` -> \`$build_type\` (exit $rc)" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    needs: preflight
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pages: read
+    outputs:
+      deploy: ${{ steps.decide.outputs.deploy }}
+      page-url: ${{ steps.pages.outputs.base_url }}
+    steps:
+      - name: Check out the caller repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node 22
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install
+        run: |
+          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+
+      - name: Configure Pages
+        id: pages
+        if: needs.preflight.outputs.build-type == 'workflow'
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+      - name: Build
+        env:
+          SITE_PAGES_URL: ${{ inputs.site-url || steps.pages.outputs.base_url }}
+          ASTRO_TELEMETRY_DISABLED: '1'
+        run: |
+          echo "SITE_PAGES_URL=${SITE_PAGES_URL:-<empty>} GITHUB_REPOSITORY=$GITHUB_REPOSITORY"
+          npm run build
+          find dist -type f | sort
+
+      - name: Decide
+        id: decide
+        env:
+          INTENT: ${{ needs.preflight.outputs.intent }}
+          BUILD_TYPE: ${{ needs.preflight.outputs.build-type }}
+        run: |
+          deploy=false
+          if [[ "$INTENT" == "true" && "$BUILD_TYPE" == "workflow" ]]; then deploy=true; fi
+          echo "deploy=$deploy" >> "$GITHUB_OUTPUT"
+          echo "intent=$INTENT build_type=$BUILD_TYPE deploy=$deploy"
+
+      - name: Upload the Pages artifact
+        if: steps.decide.outputs.deploy == 'true' || inputs.spike-force-upload
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: dist
+
+      - name: Summary
+        env:
+          DEPLOY: ${{ steps.decide.outputs.deploy }}
+          PAGE_URL: ${{ steps.pages.outputs.base_url }}
+          ENGINE_VERSION: v1
+        run: |
+          {
+            echo "### Build"
+            echo "- deploy: \`$DEPLOY\`"
+            echo "- page url: ${PAGE_URL:-not configured}"
+            echo "- engine: $ENGINE_VERSION"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "engine $ENGINE_VERSION"
