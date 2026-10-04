@@ -135,7 +135,7 @@ jobs:
         env:
           DEPLOY: ${{ steps.decide.outputs.deploy }}
           PAGE_URL: ${{ steps.pages.outputs.base_url }}
-          ENGINE_VERSION: v1
+          ENGINE_VERSION: v2
         run: |
           {
             echo "### Build"
